@@ -1,235 +1,471 @@
-# --- My Signal
-import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+# --- My Signal Pro (yfinance + timeframe selector + DB + backtest) ---
+import os
+import sqlite3
+import numpy as np
 import pandas as pd
 import requests
-import numpy as np
-from datetime import datetime
-from pytz import timezone
-import xml.etree.ElementTree as ET
-from dateutil import parser as date_parser
+import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
+from contextlib import closing
+from streamlit_autorefresh import st_autorefresh
+from datetime import datetime
+from pytz import timezone
+from dateutil import parser as date_parser
+import xml.etree.ElementTree as ET
 
+# =========================
+# STREAMLIT SETUP
+# =========================
 st.set_page_config(page_title="Signals", layout="wide")
-st.markdown("<h1 style='text-align:center; color:#007acc;'>📊 My Signal</h1>", unsafe_allow_html=True)
-st_autorefresh(interval=120000, key="ai_refresh")
+st.markdown("<h1 style='text-align:center; color:#007acc;'>📊 My Signal Pro</h1>", unsafe_allow_html=True)
 
-API_KEY = "b2a1234a9ea240f9ba85696e2a243403"
+# Sidebar controls
+with st.sidebar:
+    st.subheader("⚙️ Settings")
+    timeframe = st.selectbox(
+        "Timeframe",
+        ["5m", "15m", "30m", "1h", "4h", "1d"],
+        index=0,
+        help="Main candle interval used for indicators and signals."
+    )
+    auto_refresh_ms = st.slider("Auto-refresh (seconds)", 60, 600, 180, step=30) * 1000
+    st.caption("Tip: Longer intervals reduce Yahoo throttling.")
 
+st_autorefresh(interval=auto_refresh_ms, key="ai_refresh")
+if st.button("🔄 Refresh now"):
+    st.rerun()
+
+MTZ = timezone("Europe/Malta")
+
+# =========================
+# SYMBOL MAP (App label -> Yahoo Finance ticker)
+# =========================
 symbols = {
-    "EUR/USD": "EUR/USD", "GBP/USD": "GBP/USD", "USD/JPY": "USD/JPY",
-    "AUD/USD": "AUD/USD", "USD/CAD": "USD/CAD", "USD/CHF": "USD/CHF",
-    "XAU/USD": "XAU/USD", "WTI/USD": "WTI/USD", "EUR/JPY": "EUR/JPY", "NZD/USD": "NZD/USD",
-    "EUR/GBP": "EUR/GBP", "EUR/CAD": "EUR/CAD", "GBP/JPY": "GBP/JPY",
-    "EUR/AUD": "EUR/AUD", "AUD/JPY": "AUD/JPY", "GBP/NZD": "GBP/NZD",
-    "EUR/NZD": "EUR/NZD", "XAG/USD": "XAG/USD",
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "USDJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "USDCAD=X",
+    "USD/CHF": "USDCHF=X",
+    "NZD/USD": "NZDUSD=X",
+    "EUR/JPY": "EURJPY=X",
+    "EUR/GBP": "EURGBP=X",
+    "EUR/CAD": "EURCAD=X",
+    "GBP/JPY": "GBPJPY=X",
+    "EUR/AUD": "EURAUD=X",
+    "AUD/JPY": "AUDJPY=X",
+    "GBP/NZD": "GBPNZD=X",
+    "EUR/NZD": "EURNZD=X",
+    "XAU/USD": "GC=F",   # Gold futures
+    "XAG/USD": "SI=F",   # Silver futures
+    "WTI/USD": "CL=F",   # WTI crude futures
 }
 
-def play_rsi_alert():
-    components.html("""
-    <audio autoplay>
-        <source src="https://www.soundjay.com/button/beep-07.wav" type="audio/wav">
-    </audio>
-    """, height=0)
+# =========================
+# DB SETUP
+# =========================
+DB_PATH = "signals.db"
 
-def fetch_dxy_data():
-    try:
-        dxy = yf.Ticker("DX-Y.NYB")
-        data = dxy.history(period="1d", interval="1m")
-        if data.empty:
-            raise ValueError("No data received from yfinance")
-        current = data["Close"].iloc[-1]
-        previous = data["Close"].iloc[0]
-        change = current - previous
-        percent = (change / previous) * 100
-        return current, percent
-    except Exception as e:
-        dxy_price = 100.237
-        dxy_previous = 100.40
-        change = dxy_price - dxy_previous
-        percent = (change / dxy_previous) * 100
-        return dxy_price, percent
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_utc TEXT NOT NULL,
+            pair TEXT NOT NULL,
+            price REAL NOT NULL,
+            rsi REAL,
+            atr REAL,
+            atr_status TEXT,
+            trend TEXT,
+            reversal_signal TEXT,
+            signal_type TEXT,
+            indicators TEXT,
+            candle_pattern TEXT,
+            divergence TEXT,
+            strength TEXT,
+            suggestion_html TEXT,
+            dxy_impact TEXT,
+            src_note TEXT
+        )
+        """)
+        conn.commit()
 
-def fetch_forex_factory_news():
+@st.cache_data(ttl=5)
+def _db_exists():
+    return os.path.exists(DB_PATH)
+
+def log_signals(rows, diag_lines):
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    src = " | ".join(diag_lines[:1]) if diag_lines else ""
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.cursor()
+        for r in rows:
+            strength = ("Strong" if "Strong" in (r.get("AI Suggestion") or "")
+                        else "Medium" if "Medium" in (r.get("AI Suggestion") or "")
+                        else "None")
+            cur.execute("""
+            INSERT INTO signals
+            (ts_utc, pair, price, rsi, atr, atr_status, trend, reversal_signal, signal_type,
+             indicators, candle_pattern, divergence, strength, suggestion_html, dxy_impact, src_note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                ts, r.get("Pair"), float(r.get("Price", 0)), float(r.get("RSI", 0)), float(r.get("ATR", 0)),
+                r.get("ATR Status"), r.get("Trend"), r.get("Reversal Signal"), r.get("Signal Type"),
+                r.get("Confirmed Indicators"), r.get("Candle Pattern"), r.get("Divergence"),
+                strength, r.get("AI Suggestion"), r.get("DXY Impact"), src
+            ))
+        conn.commit()
+
+# Initialize DB once
+init_db()
+
+# =========================
+# UI / ALERT UTILS
+# =========================
+def play_beep_once_per_window(seconds=30):
+    now = datetime.utcnow()
+    last = st.session_state.get("last_beep", datetime.min)
+    if (now - last).total_seconds() > seconds:
+        components.html(
+            """
+            <audio autoplay>
+                <source src="https://www.soundjay.com/button/beep-07.wav" type="audio/wav">
+            </audio>
+            """,
+            height=0,
+        )
+        st.session_state["last_beep"] = now
+
+# =========================
+# NEWS (ForexFactory RSS) — optional helper (not shown in main table)
+# =========================
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_forex_factory_news_today():
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
-    response = requests.get(url)
+    today_malta = datetime.now(MTZ).date()
     try:
-        root = ET.fromstring(response.content)
-    except ET.ParseError as e:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+    except Exception:
         return []
-
-    news_data = []
+    out = []
     for item in root.findall("./channel/item"):
         try:
             title = item.find("title").text
-            pub_time = date_parser.parse(item.find("pubDate").text)
+            pub_time = date_parser.parse(item.find("pubDate").text).astimezone(MTZ)
             currency = item.find("{http://www.forexfactory.com/rss}currency").text.strip().upper()
-            if pub_time.date() == datetime.utcnow().date():
-                news_data.append({
-                    "title": title,
-                    "time": pub_time,
-                    "currency": currency
-                })
-        except:
+            if pub_time.date() == today_malta:
+                out.append({"title": title, "time": pub_time, "currency": currency})
+        except Exception:
             continue
-    return news_data
+    return out
 
-def analyze_impact(title):
-    title = title.lower()
-    if any(x in title for x in ["cpi", "gdp", "employment", "retail", "core", "inflation", "interest rate"]):
-        if any(w in title for w in ["increase", "higher", "rises", "strong", "beats"]):
+def analyze_impact(title: str) -> str:
+    t = title.lower()
+    if any(x in t for x in ["cpi", "gdp", "employment", "retail", "core", "inflation", "interest rate"]):
+        if any(w in t for w in ["increase", "higher", "rises", "strong", "beats"]):
             return "🟢 Positive"
-        elif any(w in title for w in ["decrease", "lower", "falls", "weak", "misses"]):
+        elif any(w in t for w in ["decrease", "lower", "falls", "weak", "misses"]):
             return "🔴 Negative"
         else:
             return "🟡 Mixed"
     return "⚪ Neutral"
 
-def get_today_news_with_impact(pair):
-    base, quote = pair.split('/')
-    quote = quote.upper()
-    today_events = []
+def get_today_news_with_impact(pair: str, news_events):
+    base, quote = pair.split("/")
+    wanted = {base.upper(), quote.upper()}
+    events = []
     for n in news_events:
-        if n["currency"] == quote:
+        if n["currency"] in wanted:
             impact = analyze_impact(n["title"])
             time_str = n["time"].strftime("%H:%M")
-            today_events.append(f"{n['title']} ({impact}) @ {time_str}")
-    return today_events or ["—"]
+            events.append(f"{n['title']} ({impact}) @ {time_str}")
+    return events or ["—"]
 
-def calculate_rsi(series, period=14):
+# =========================
+# DATA SOURCE (Yahoo Finance) — Resilient fetcher
+# =========================
+# For each selected timeframe, we try multiple historical spans to ensure enough bars for indicators.
+PERIOD_OPTIONS_BY_INTERVAL = {
+    "5m":  ["7d", "10d", "30d", "60d"],
+    "15m": ["30d", "60d", "90d"],
+    "30m": ["60d", "90d", "180d"],
+    "1h":  ["90d", "180d", "1y"],
+    "4h":  ["2y", "5y"],
+    "1d":  ["1y", "2y", "5y", "10y"],
+}
+
+# Alternates for tricky symbols (spot/futures)
+ALT_TICKERS = {
+    "XAU/USD": ["GC=F", "XAUUSD=X"],
+    "XAG/USD": ["SI=F", "XAGUSD=X"],
+    "WTI/USD": ["CL=F"],
+}
+
+def _try_download(ticker, interval, period):
+    try:
+        df = yf.download(
+            tickers=ticker, period=period, interval=interval,
+            auto_adjust=False, progress=False, group_by="ticker"
+        )
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            first = df.columns.levels[0][0]
+            df = df[first]
+        df = df.rename(columns=str.lower).reset_index()
+        if "Datetime" in df.columns:
+            df = df.rename(columns={"Datetime": "datetime"})
+        elif "Date" in df.columns:
+            df = df.rename(columns={"Date": "datetime"})
+        elif "index" in df.columns:
+            df = df.rename(columns={"index": "datetime"})
+        if "datetime" not in df.columns:
+            return pd.DataFrame()
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df = df.sort_values("datetime").set_index("datetime")
+        keep = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        return df[keep]
+    except Exception:
+        return pd.DataFrame()
+
+def _try_history(ticker, interval, period):
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, interval=interval, auto_adjust=False)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns=str.lower).reset_index()
+        if "Date" in df.columns and "datetime" not in df.columns:
+            df = df.rename(columns={"Date": "datetime"})
+        if "Datetime" in df.columns and "datetime" not in df.columns:
+            df = df.rename(columns={"Datetime": "datetime"})
+        if "datetime" not in df.columns:
+            return pd.DataFrame()
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df = df.sort_values("datetime").set_index("datetime")
+        keep = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+        return df[keep]
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_yf_data_resilient(label: str, yf_symbol: str, interval: str) -> pd.DataFrame:
+    periods = PERIOD_OPTIONS_BY_INTERVAL.get(interval, ["60d"])
+    candidates = ALT_TICKERS.get(label, [yf_symbol])
+    for ticker in candidates:
+        for period in periods:
+            # try download() then history()
+            df = _try_download(ticker, interval, period)
+            if not df.empty and {"open","high","low","close"}.issubset(df.columns):
+                df.attrs["src"] = f"download {ticker} {interval}/{period}"
+                return df
+            df = _try_history(ticker, interval, period)
+            if not df.empty and {"open","high","low","close"}.issubset(df.columns):
+                df.attrs["src"] = f"history {ticker} {interval}/{period}"
+                return df
+    return pd.DataFrame()
+
+def fetch_dxy_data():
+    for ticker in ["^DXY", "DX-Y.NYB"]:
+        try:
+            hist = yf.download(tickers=ticker, period="1d", interval="5m", progress=False)
+            if hist is None or hist.empty:
+                continue
+            current = float(hist["Close"].iloc[-1])
+            previous = float(hist["Close"].iloc[0])
+            pct = ((current - previous) / previous) * 100 if previous else 0.0
+            return current, pct
+        except Exception:
+            continue
+    return None, None
+
+# =========================
+# INDICATORS
+# =========================
+def calculate_rsi(series: pd.Series, period=14):
     delta = series.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def calculate_macd(series):
+def calculate_macd(series: pd.Series):
     ema12 = series.ewm(span=12, adjust=False).mean()
     ema26 = series.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
     return macd, signal
 
-def calculate_ema(series, period):
+def calculate_ema(series: pd.Series, period):
     return series.ewm(span=period, adjust=False).mean()
 
-def calculate_atr(df, period=14):
-    tr1 = df['high'] - df['low']
-    tr2 = abs(df['high'] - df['close'].shift())
-    tr3 = abs(df['low'] - df['close'].shift())
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
+def calculate_atr(df: pd.DataFrame, period=14):
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = pd.concat([(high - low), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def calculate_adx(df, period=14):
-    df['TR'] = np.maximum(df['high'] - df['low'],
-                          np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
-    df['+DM'] = np.where((df['high'] - df['high'].shift()) > (df['low'].shift() - df['low']),
-                         np.maximum(df['high'] - df['high'].shift(), 0), 0)
-    df['-DM'] = np.where((df['low'].shift() - df['low']) > (df['high'] - df['high'].shift()),
-                         np.maximum(df['low'].shift() - df['low'], 0), 0)
-    tr14 = df['TR'].rolling(window=period).mean()
-    plus_dm14 = df['+DM'].rolling(window=period).mean()
-    minus_dm14 = df['-DM'].rolling(window=period).mean()
-    plus_di14 = 100 * (plus_dm14 / tr14)
-    minus_di14 = 100 * (minus_dm14 / tr14)
-    dx = 100 * abs(plus_di14 - minus_di14) / (plus_di14 + minus_di14)
-    return dx.rolling(window=period).mean()
+def calculate_adx(df: pd.DataFrame, period=14):
+    up_move = df["high"].diff()
+    down_move = -df["low"].diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-def detect_candle_pattern(df):
-    o, c, h, l = df['open'].iloc[-2:], df['close'].iloc[-2:], df['high'].iloc[-2:], df['low'].iloc[-2:]
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr
+
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
+    return dx.ewm(alpha=1/period, adjust=False).mean()
+
+def detect_candle_pattern(df: pd.DataFrame):
+    if len(df) < 2:
+        return ""
+    o, c, h, l = df["open"].iloc[-2:], df["close"].iloc[-2:], df["high"].iloc[-2:], df["low"].iloc[-2:]
     co, cc, ch, cl = o.iloc[-1], c.iloc[-1], h.iloc[-1], l.iloc[-1]
     po, pc = o.iloc[-2], c.iloc[-2]
-    body, range_ = abs(cc - co), ch - cl
-    if body < range_ * 0.1: return "Doji"
-    if pc < po and cc > co and cc > po and co < pc: return "Bullish Engulfing"
-    if pc > po and cc < co and cc < po and co > pc: return "Bearish Engulfing"
-    if body < range_ * 0.3 and cl < co and cl < cc and (ch - max(co, cc)) < body: return "Hammer"
-    if body < range_ * 0.3 and ch > co and ch > cc and (min(co, cc) - cl) < body: return "Shooting Star"
+    body, rng = abs(cc - co), ch - cl
+    if rng == 0:
+        return ""
+    if body < rng * 0.1:
+        return "Doji"
+    if pc < po and cc > co and cc > po and co < pc:
+        return "Bullish Engulfing"
+    if pc > po and cc < co and cc < po and co > pc:
+        return "Bearish Engulfing"
+    if body < rng * 0.3 and cl < co and cl < cc and (ch - max(co, cc)) < body:
+        return "Hammer"
+    if body < rng * 0.3 and ch > co and ch > cc and (min(co, cc) - cl) < body:
+        return "Shooting Star"
     return ""
 
-def detect_trend_reversal(df):
-    e9, e20 = df['EMA9'].iloc[-3:], df['EMA20'].iloc[-3:]
-    if e9[0] < e20[0] and e9[1] > e20[1] and e9[2] > e20[2]: return "Reversal Confirmed Bullish"
-    if e9[0] > e20[0] and e9[1] < e20[1] and e9[2] < e20[2]: return "Reversal Confirmed Bearish"
-    if e9[-2] < e20[-2] and e9[-1] > e20[-1]: return "Reversal Forming Bullish"
-    if e9[-2] > e20[-2] and e9[-1] < e20[-1]: return "Reversal Forming Bearish"
+def detect_trend_reversal(df: pd.DataFrame):
+    if len(df) < 3:
+        return ""
+    e9, e20 = df["EMA9"].iloc[-3:], df["EMA20"].iloc[-3:]
+    if e9.iloc[0] < e20.iloc[0] and e9.iloc[1] > e20.iloc[1] and e9.iloc[2] > e20.iloc[2]:
+        return "Reversal Confirmed Bullish"
+    if e9.iloc[0] > e20.iloc[0] and e9.iloc[1] < e20.iloc[1] and e9.iloc[2] < e20.iloc[2]:
+        return "Reversal Confirmed Bearish"
+    if e9.iloc[-2] < e20.iloc[-2] and e9.iloc[-1] > e20.iloc[-1]:
+        return "Reversal Forming Bullish"
+    if e9.iloc[-2] > e20.iloc[-2] and e9.iloc[-1] < e20.iloc[-1]:
+        return "Reversal Forming Bearish"
     return ""
 
-def detect_divergence(df):
-    closes = df['close']
-    rsis = df['RSI']
+def detect_divergence(df: pd.DataFrame):
+    closes = df["close"]
+    rsis = df["RSI"]
     if len(closes) < 10 or len(rsis) < 10:
         return ""
-    recent_price_low = closes.iloc[-5:].idxmin()
-    recent_price_high = closes.iloc[-5:].idxmax()
-    recent_rsi_low = rsis.iloc[-5:].idxmin()
-    recent_rsi_high = rsis.iloc[-5:].idxmax()
+    window = 5
+    pr_low_idx = closes.iloc[-window:].idxmin()
+    pr_high_idx = closes.iloc[-window:].idxmax()
+    rsi_low_idx = rsis.iloc[-window:].idxmin()
+    rsi_high_idx = rsis.iloc[-window:].idxmax()
 
-    if recent_price_low != recent_rsi_low and closes[recent_price_low] < closes[-1] and rsis[recent_rsi_low] > rsis[-1]:
+    last_close = closes.iloc[-1]
+    last_rsi = rsis.iloc[-1]
+
+    pr_low_close = closes.loc[pr_low_idx]
+    pr_high_close = closes.loc[pr_high_idx]
+    rsi_at_low = rsis.loc[rsi_low_idx]
+    rsi_at_high = rsis.loc[rsi_high_idx]
+
+    if (pr_low_idx != rsi_low_idx) and (pr_low_close < last_close) and (rsi_at_low > last_rsi):
         return "Bullish Divergence"
-    if recent_price_high != recent_rsi_high and closes[recent_price_high] > closes[-1] and rsis[recent_rsi_high] < rsis[-1]:
+    if (pr_high_idx != rsi_high_idx) and (pr_high_close > last_close) and (rsi_at_high < last_rsi):
         return "Bearish Divergence"
     return ""
 
-def generate_ai_suggestion(price, indicators, atr, signal_type):
-    if not indicators: return ""
+def score_signal(indicators, signal_type):
+    score = 0
+    if "EMA" in indicators: score += 2
+    if "MACD" in indicators: score += 1
+    if "RSI" in indicators: score += 1
+    if "ADX" in indicators: score += 1
+    if "Candle" in indicators: score += 1
+    if "Divergence" in indicators: score += 2
+    if signal_type in ("Bullish", "Bearish"): score += 1
+    if score >= 6: return "Strong"
+    if score >= 4: return "Medium"
+    return "None"
+
+def generate_ai_suggestion(price, atr, signal_type, strength):
+    if strength == "None" or not signal_type:
+        return ""
     sl = price - (atr * 1.2) if signal_type == "Bullish" else price + (atr * 1.2)
     tp = price + (atr * 2.5) if signal_type == "Bullish" else price - (atr * 2.5)
-    count = len(indicators)
-    if count >= 4:
-        conf = "Strong"
-    elif count == 3:
-        conf = "Medium"
-    else:
-        return ""
     color = "green" if signal_type == "Bullish" else "red"
-    signal_txt = f"{conf} <span style='color:{color}'>{signal_type}</span> Signal @ {price:.5f}"
-    return f"{signal_txt} | SL: {sl:.5f} | TP: {tp:.5f} | Confidence: {conf}"
+    return f"{strength} <span style='color:{color}'>{signal_type}</span> Signal @ {price:.5f} | SL: {sl:.5f} | TP: {tp:.5f}"
 
-news_events = fetch_forex_factory_news()
+# =========================
+# MAIN RUN
+# =========================
+news_events = fetch_forex_factory_news_today()
 dxy_price, dxy_change = fetch_dxy_data()
+
 rows = []
+diag = []
 
-for label, symbol in symbols.items():
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=200&apikey={API_KEY}"
-    r = requests.get(url).json()
-    if "values" not in r:
+for label, yf_symbol in symbols.items():
+    df = fetch_yf_data_resilient(label, yf_symbol, timeframe)
+    if df.empty or not set(["open", "high", "low", "close"]).issubset(df.columns):
+        diag.append(f"❌ {label}: no data for {yf_symbol} at {timeframe}")
         continue
+    else:
+        diag.append(f"✅ {label}: {df.attrs.get('src','yfinance')}  rows={len(df)}")
 
-    df = pd.DataFrame(r["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df.set_index("datetime", inplace=True)
-    df = df.astype(float).sort_index()
+    # Indicators
     df["RSI"] = calculate_rsi(df["close"])
-    df["MACD"], df["MACD_Signal"] = calculate_macd(df["close"])
+    macd, macd_sig = calculate_macd(df["close"])
+    df["MACD"], df["MACD_Signal"] = macd, macd_sig
     df["EMA9"] = calculate_ema(df["close"], 9)
     df["EMA20"] = calculate_ema(df["close"], 20)
-    df["ADX"] = calculate_adx(df)
     df["ATR"] = calculate_atr(df)
-    df.dropna(inplace=True)
+    df["ADX"] = calculate_adx(df)
 
-    price = df["close"].iloc[-1]
-    atr = df["ATR"].iloc[-1]
-    trend = "Bullish" if df["EMA9"].iloc[-1] > df["EMA20"].iloc[-1] and price > df["EMA9"].iloc[-1] else \
-            "Bearish" if df["EMA9"].iloc[-1] < df["EMA20"].iloc[-1] and price < df["EMA9"].iloc[-1] else "Sideways"
+    # Clean / warm-up cut
+    df = df.dropna().copy()
+    min_required = 50 if timeframe in ["5m","15m","30m","1h"] else 30
+    if len(df) < min_required:
+        diag.append(f"ℹ️  {label}: only {len(df)} bars after indicators; need >= {min_required}")
+        continue
 
-    rsi_val = df["RSI"].iloc[-1]
+    price = float(df["close"].iloc[-1])
+    atr = float(df["ATR"].iloc[-1])
+
+    # Trend
+    if (df["EMA9"].iloc[-1] > df["EMA20"].iloc[-1]) and (price > df["EMA9"].iloc[-1]):
+        trend = "Bullish"
+    elif (df["EMA9"].iloc[-1] < df["EMA20"].iloc[-1]) and (price < df["EMA9"].iloc[-1]):
+        trend = "Bearish"
+    else:
+        trend = "Sideways"
+
+    # Signals
+    rsi_val = float(df["RSI"].iloc[-1])
     indicators = []
     signal_type = ""
-
-    if rsi_val > 50:
-        indicators.append("Bullish")
-        signal_type = "Bullish"
-    elif rsi_val < 50:
-        indicators.append("Bearish")
-        signal_type = "Bearish"
+    if rsi_val >= 55:
+        indicators.append("RSI"); signal_type = "Bullish"
+    elif rsi_val <= 45:
+        indicators.append("RSI"); signal_type = "Bearish"
 
     if df["MACD"].iloc[-1] > df["MACD_Signal"].iloc[-1]:
         indicators.append("MACD")
-    if df["EMA9"].iloc[-1] > df["EMA20"].iloc[-1] and price > df["EMA9"].iloc[-1]:
+    if (df["EMA9"].iloc[-1] > df["EMA20"].iloc[-1]) and (price > df["EMA9"].iloc[-1]):
         indicators.append("EMA")
     if df["ADX"].iloc[-1] > 20:
         indicators.append("ADX")
@@ -241,50 +477,114 @@ for label, symbol in symbols.items():
     divergence = detect_divergence(df)
     if divergence:
         indicators.append("Divergence")
-        play_rsi_alert()
+        play_beep_once_per_window(30)
 
-    suggestion = generate_ai_suggestion(price, indicators, atr, signal_type)
+    strength = score_signal(indicators, signal_type)
+    suggestion = generate_ai_suggestion(price, atr, signal_type, strength)
+
+    # DXY impact for USD pairs
+    dxy_txt = "—"
+    if "USD" in label and (dxy_price is not None) and (dxy_change is not None):
+        sign = "+" if dxy_change >= 0 else ""
+        dxy_txt = f"{dxy_price:.2f} ({sign}{dxy_change:.2f}%)"
+
+    # ATR status
+    atr_status = "🔴 Low" if atr < 0.0004 else "🟡 Normal" if atr < 0.0009 else "🟢 High"
 
     rows.append({
-        "Pair": label, "Price": round(price, 5), "RSI": round(rsi_val, 2),
-        "ATR": round(atr, 5), "ATR Status": "🔴 Low" if atr < 0.0004 else "🟡 Normal" if atr < 0.0009 else "🟢 High",
-        "Trend": trend, "Reversal Signal": detect_trend_reversal(df),
-        "Signal Type": signal_type, "Confirmed Indicators": ", ".join(indicators),
-        "Candle Pattern": pattern or "—", "AI Suggestion": suggestion,
-        "DXY Impact": f"{dxy_price:.2f} ({dxy_change:+.2f}%)" if "USD" in label and dxy_price is not None else "—",
-        "Divergence": divergence or "—"
+        "Pair": label,
+        "Price": round(price, 5),
+        "RSI": round(rsi_val, 2),
+        "ATR": round(atr, 5),
+        "ATR Status": atr_status,
+        "Trend": trend,
+        "Reversal Signal": detect_trend_reversal(df) or "—",
+        "Signal Type": signal_type or "—",
+        "Confirmed Indicators": ", ".join(indicators) if indicators else "—",
+        "Candle Pattern": pattern or "—",
+        "Divergence": divergence or "—",
+        "AI Suggestion": suggestion or "",
+        "DXY Impact": dxy_txt,
+        # Uncomment to include per-pair news:
+        # "Today News": " • ".join(get_today_news_with_impact(label, news_events)),
     })
-column_order = ["Pair", "Price", "RSI", "ATR", "ATR Status", "Trend", "Reversal Signal",
-                "Signal Type", "Confirmed Indicators", "Candle Pattern", "Divergence", "AI Suggestion",
-                "DXY Impact"]
+
+# =========================
+# RENDER + LOGGING CONTROLS
+# =========================
+colA, colB, colC = st.columns([1,1,3])
+with colA:
+    enable_log = st.toggle("💾 Auto-log this scan", value=False,
+                           help="When ON, each refresh appends the current table to the DB.")
+with colB:
+    if st.button("Append to DB now") and rows:
+        log_signals(rows, diag)
+        st.success(f"Logged {len(rows)} rows to {DB_PATH}")
+with colC:
+    if _db_exists() and st.button("🔍 Preview last 10 logs"):
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            df_prev = pd.read_sql_query(
+                "SELECT ts_utc,pair,price,signal_type,strength,trend,indicators FROM signals ORDER BY id DESC LIMIT 10", conn)
+        st.dataframe(df_prev, use_container_width=True)
+
+if enable_log and rows:
+    log_signals(rows, diag)
+
+if not rows:
+    st.error("No rows produced. See diagnostics below.")
+    if diag:
+        with st.expander("Diagnostics"):
+            for line in diag:
+                st.write(line)
+    st.stop()
 
 df_result = pd.DataFrame(rows)
-df_result["Score"] = df_result["AI Suggestion"].apply(lambda x: 3 if "Strong" in x else 2 if "Medium" in x else 0)
+
+# Strong/Medium sorting
+score_series = np.select(
+    [
+        df_result["AI Suggestion"].fillna("").str.contains("Strong"),
+        df_result["AI Suggestion"].fillna("").str.contains("Medium"),
+    ],
+    [3, 2],
+    default=0,
+)
+df_result["Score"] = score_series
 df_sorted = df_result.sort_values(by="Score", ascending=False).drop(columns=["Score"])
 
-styled_html = "<table style='width:100%; border-collapse: collapse;'>"
+column_order = [
+    "Pair", "Price", "RSI", "ATR", "ATR Status", "Trend", "Reversal Signal",
+    "Signal Type", "Confirmed Indicators", "Candle Pattern", "Divergence",
+    "AI Suggestion", "DXY Impact"
+    # , "Today News"
+]
+
+styled_html = "<div style='overflow-x:auto'>"
+styled_html += "<table style='width:100%; border-collapse: collapse;'>"
 styled_html += "<tr>" + "".join([
-    f"<th style='border:1px solid #ccc; padding:6px; background:#e0e0e0'>{col}</th>" for col in column_order]) + "</tr>"
+    f"<th style='border:1px solid #ccc; padding:6px; background:#e0e0e0; position:sticky; top:0'>{col}</th>"
+    for col in column_order
+]) + "</tr>"
 
 for _, row in df_sorted.iterrows():
     style = 'background-color: #d4edda;' if "Strong" in row["AI Suggestion"] else \
             'background-color: #d1ecf1;' if "Medium" in row["AI Suggestion"] else ''
     styled_html += f"<tr style='{style}'>"
     for col in column_order:
-        val = row[col]
+        val = row.get(col, "—")
         if col == "Pair":
             val = f"<strong style='font-size: 18px;'>{val}</strong>"
         elif col == "Trend":
             color = 'green' if row['Trend'] == 'Bullish' else 'red' if row['Trend'] == 'Bearish' else 'gray'
             val = f"<span style='color:{color}; font-weight:bold;'>{row['Trend']}</span>"
         elif col == "Signal Type":
-            color = 'green' if row['Signal Type'] == 'Bullish' else 'red'
+            color = 'green' if row['Signal Type'] == 'Bullish' else 'red' if row['Signal Type'] == 'Bearish' else 'gray'
             val = f"<span style='color:{color}; font-weight:bold;'>{row['Signal Type']}</span>"
         elif col == "RSI":
             color = "red" if row["RSI"] > 75 else "green" if row["RSI"] < 20 else "black"
-            val = f"<span style='color:{color}; font-weight:bold;'>{row['RSI']}</span>"
+            val = f"<span style='color:{color}; font-weight:bold;'>{val}</span>"
         elif col == "DXY Impact" and row["DXY Impact"] != "—":
-            dxy_color = "green" if '+' in row["DXY Impact"] else "red"
+            dxy_color = "green" if "+" in str(row["DXY Impact"]) else "red"
             val = f"<span style='color:{dxy_color}; font-weight:bold;'>{row['DXY Impact']}</span>"
         elif col == "Divergence" and row["Divergence"] != "—":
             div_color = "green" if "Bullish" in row["Divergence"] else "red"
@@ -292,8 +592,144 @@ for _, row in df_sorted.iterrows():
         styled_html += f"<td style='border:1px solid #ccc; padding:6px; white-space:pre-wrap;'>{val}</td>"
     styled_html += "</tr>"
 
-styled_html += "</table>"
+styled_html += "</table></div>"
 st.markdown(styled_html, unsafe_allow_html=True)
-st.caption(f"Timeframe: 5-Min | Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+tz_label = datetime.now(MTZ).strftime('%Y-%m-%d %H:%M:%S %Z')
+st.caption(f"Timeframe: {timeframe} | Last updated: {tz_label}")
 st.text(f"Scanned Pairs: {len(rows)}")
-st.text(f"Strong Signals Found: {len([r for r in rows if 'Strong' in r['AI Suggestion']])}")
+st.text(f"Strong Signals Found: {sum('Strong' in (r.get('AI Suggestion') or '') for r in rows)}")
+
+with st.expander("Data diagnostics"):
+    for line in diag:
+        st.write(line)
+
+# =========================
+# BACKTEST (uses same rules, on history of selected timeframe)
+# =========================
+def generate_signals_over_history(df):
+    out = df.copy()
+    out["RSI"] = calculate_rsi(out["close"])
+    macd, macd_sig = calculate_macd(out["close"])
+    out["MACD"], out["MACD_Signal"] = macd, macd_sig
+    out["EMA9"] = calculate_ema(out["close"], 9)
+    out["EMA20"] = calculate_ema(out["close"], 20)
+    out["ATR"] = calculate_atr(out)
+    out["ADX"] = calculate_adx(out)
+    out = out.dropna().copy()
+
+    cond_trend_bull = (out["EMA9"] > out["EMA20"]) & (out["close"] > out["EMA9"])
+    cond_trend_bear = (out["EMA9"] < out["EMA20"]) & (out["close"] < out["EMA9"])
+    rsi_bull = out["RSI"] >= 55
+    rsi_bear = out["RSI"] <= 45
+    macd_bull = out["MACD"] > out["MACD_Signal"]
+    adx_trend = out["ADX"] > 20
+
+    out["ind_EMA"] = cond_trend_bull | cond_trend_bear
+    out["ind_MACD"] = macd_bull
+    out["ind_RSI"] = rsi_bull | rsi_bear
+    out["ind_ADX"] = adx_trend
+
+    out["score"] = (
+        out["ind_EMA"].astype(int)*2 +
+        out["ind_MACD"].astype(int) +
+        out["ind_RSI"].astype(int) +
+        out["ind_ADX"].astype(int)
+    )
+    out["signal_type"] = np.where(rsi_bull, "Bullish", np.where(rsi_bear, "Bearish", ""))
+    out["trend"] = np.where(cond_trend_bull, "Bullish", np.where(cond_trend_bear, "Bearish", "Sideways"))
+    out["strength"] = np.where(out["score"] >= 6, "Strong", np.where(out["score"] >= 4, "Medium", "None"))
+    return out
+
+def backtest_pair(yf_symbol, label, interval, sl_mult=1.2, tp_mult=2.5, max_hold_bars=96, use_strength=("Strong","Medium")):
+    df = fetch_yf_data_resilient(label, yf_symbol, interval)
+    if df.empty:
+        return pd.DataFrame(), {"error": f"No data for {label} at {interval}"}
+    sig = generate_signals_over_history(df)
+    if sig.empty:
+        return pd.DataFrame(), {"error": "No usable bars after indicators."}
+
+    trades = []
+    in_trade = False
+    entry_price = entry_time = direction = None
+    atr_entry = None
+    prev_dir = ""
+    bars_held = 0
+
+    for t, row in sig.iterrows():
+        dir_now = row["signal_type"]
+        if not in_trade:
+            if dir_now and row["strength"] in use_strength and dir_now != prev_dir:
+                in_trade = True
+                entry_price = row["close"]
+                entry_time = t
+                direction = dir_now
+                atr_entry = row["ATR"]
+                sl = entry_price - sl_mult*atr_entry if direction == "Bullish" else entry_price + sl_mult*atr_entry
+                tp = entry_price + tp_mult*atr_entry if direction == "Bullish" else entry_price - tp_mult*atr_entry
+                bars_held = 0
+        else:
+            bars_held += 1
+            price = row["close"]
+            hit_tp = (price >= tp) if direction == "Bullish" else (price <= tp)
+            hit_sl = (price <= sl) if direction == "Bullish" else (price >= sl)
+            exit_now = hit_tp or hit_sl or (bars_held >= max_hold_bars)
+            if exit_now:
+                pnl = (price - entry_price) if direction == "Bullish" else (entry_price - price)
+                trades.append({
+                    "pair": label,
+                    "entry_time": entry_time,
+                    "exit_time": t,
+                    "direction": direction,
+                    "entry": entry_price,
+                    "exit": price,
+                    "pnl": pnl,
+                    "bars": bars_held,
+                    "hit": "TP" if hit_tp else ("SL" if hit_sl else "TIME")
+                })
+                in_trade = False
+                entry_price = entry_time = direction = atr_entry = None
+        prev_dir = dir_now
+
+    trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        return trades_df, {"trades": 0, "winrate": 0, "avg_pnl": 0, "total_pnl": 0}
+    total_pnl = trades_df["pnl"].sum()
+    winrate = (trades_df["pnl"] > 0).mean()*100
+    stats = {
+        "trades": len(trades_df),
+        "winrate": round(winrate, 2),
+        "avg_pnl": round(trades_df["pnl"].mean(), 5),
+        "median_pnl": round(trades_df["pnl"].median(), 5),
+        "total_pnl": round(total_pnl, 5),
+        "tp_rate": round((trades_df["hit"]=="TP").mean()*100, 2),
+        "sl_rate": round((trades_df["hit"]=="SL").mean()*100, 2),
+    }
+    return trades_df, stats
+
+with st.expander("🧪 Backtest (replays current rules on selected timeframe)"):
+    bt_pair = st.selectbox("Pair to backtest", list(symbols.keys()))
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        sl_mult = st.number_input("SL = ATR ×", min_value=0.5, max_value=5.0, value=1.2, step=0.1)
+    with c2:
+        tp_mult = st.number_input("TP = ATR ×", min_value=0.5, max_value=10.0, value=2.5, step=0.1)
+    with c3:
+        max_hold = st.number_input("Max bars per trade", min_value=12, max_value=500, value=96, step=6)
+    with c4:
+        use_str = st.multiselect("Use signals", ["Strong","Medium"], default=["Strong","Medium"])
+
+    if st.button("Run backtest"):
+        trades_df, stats = backtest_pair(
+            symbols[bt_pair], bt_pair, timeframe,
+            sl_mult=float(sl_mult), tp_mult=float(tp_mult),
+            max_hold_bars=int(max_hold),
+            use_strength=tuple(use_str) if use_str else ("Strong","Medium")
+        )
+        if "error" in stats:
+            st.warning(stats["error"])
+        else:
+            st.write(f"**Trades:** {stats['trades']}  |  **Winrate:** {stats['winrate']}%  |  "
+                     f"**TP rate:** {stats['tp_rate']}%  |  **SL rate:** {stats['sl_rate']}%  |  "
+                     f"**Total PnL:** {stats['total_pnl']}")
+            st.dataframe(trades_df, use_container_width=True)
