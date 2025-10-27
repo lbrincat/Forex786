@@ -9,11 +9,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
 from contextlib import closing
-from streamlit_autorefresh import st_autorefresh
 from datetime import datetime
 from pytz import timezone
 from dateutil import parser as date_parser
 import xml.etree.ElementTree as ET
+
 
 # ============================================================
 # STREAMLIT BASE SETUP
@@ -1086,3 +1086,4 @@ if mode == "Full Strategy Signals":
                     f"**Total PnL:** {stats['total_pnl']}"
                 )
                 st.dataframe(trades_df, use_container_width=True)
+
